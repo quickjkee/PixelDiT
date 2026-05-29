@@ -107,12 +107,12 @@ data:
   # used for training and `train_dataset` below is ignored. Leave it commented
   # out to fall back to the local ImageNetFolderDataset path.
   yt_config_path: configs/imagenet_yt_config.yaml
-  train_dataset:
-    class_path: src.data.ImageNetFolderDataset
-    init_args:
-      data_dir: /mnt/data/imagenet
-      image_size: 256
-      random_flip: true
+  #train_dataset:
+  #  class_path: src.data.ImageNetFolderDataset
+  #  init_args:
+  #    data_dir: /mnt/data/imagenet
+  #    image_size: 256
+  #    random_flip: true
   eval_dataset:
     class_path: src.data.ClassLabelRandomNDataset
     init_args:
