@@ -106,4 +106,4 @@ if [[ -n "$AUTO_RESUME" ]]; then
     CMD+=("--auto_resume=true")
 fi
 
-CUDA_VISIBLE_DEVICES=3 "${CMD[@]}"
+"${CMD[@]}"
