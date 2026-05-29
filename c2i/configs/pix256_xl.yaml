@@ -49,7 +49,7 @@ trainer:
       init_args:
          enable: true
          eval_start_epoch: 0      # start evaluating from this epoch (warmup)
-         eval_every_n_epochs: 10  # JiT --eval_freq
+         eval_every_n_epochs: 40  # JiT --eval_freq
          eval_on_last_epoch: true
 model:
   enable_profiling: true
