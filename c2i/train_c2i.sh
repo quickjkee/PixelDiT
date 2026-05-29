@@ -61,7 +61,7 @@ done
 
 echo "Starting distributed training with torchrun..."
 if [[ "$CONFIG_FILE" != /* ]]; then
-    CONFIG_FILE="$C2I_ROOT/$CONFIG_FILE"
+    CONFIG_FILE="$CONFIG_FILE"
 fi
 
 # --resume: a path ending in .ckpt resumes that exact checkpoint; any other
