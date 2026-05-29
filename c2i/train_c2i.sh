@@ -93,7 +93,7 @@ CMD=(torchrun
     --master_addr="$MASTER_ADDR"
     --master_port="$MASTER_PORT"
     --node_rank="$NODE_RANK"
-    "$C2I_ROOT/main.py" fit
+    "main.py" fit
     -c "$CONFIG_FILE"
     --trainer.num_nodes="$NUM_NODES"
     --trainer.devices="$NUM_GPUS")
