@@ -15,14 +15,16 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   logger:
-      class_path: lightning.pytorch.loggers.WandbLogger
+      class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
-        project: pix_dit_c2i
+        save_dir: ./train_logs/
         name: *exp
   num_sanity_val_steps: 0
   max_steps: 1600000
-  val_check_interval: 100000
-  check_val_every_n_epoch: null
+  # Online eval is epoch-driven: Lightning offers validation every epoch and
+  # EvalScheduleHook decides which epochs actually run it (JiT --eval_freq style).
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
   log_every_n_steps: 50
   deterministic: null
   inference_mode: true
@@ -37,6 +39,18 @@ trainer:
       init_args:
          save_dir: val_256_xl
          save_compressed: true
+         # JiT-style online FID against precomputed ImageNet-256 stats
+         compute_fid: true
+         fid_stats_path: fid_stats/jit_in256_stats.npz
+         inception_path: fid_stats/pt_inception-2015-12-05-6726825d.pth
+         fid_batch_size: 50
+    # Controls WHICH epochs run online eval (generation + FID).
+    - class_path: src.utils.EvalScheduleHook
+      init_args:
+         enable: true
+         eval_start_epoch: 0      # start evaluating from this epoch (warmup)
+         eval_every_n_epochs: 10  # JiT --eval_freq
+         eval_on_last_epoch: true
 model:
   enable_profiling: true
   profiling_print_freq: 1000
@@ -89,10 +103,16 @@ model:
       lr: 1e-4
       weight_decay: 0.0
 data:
+  # Optional: YT-table training loader (JiT-style). If set, the YT loader is
+  # used for training and `train_dataset` below is ignored. Leave it commented
+  # out to fall back to the local ImageNetFolderDataset path.
+  yt_config_path: configs/imagenet_yt_config.yaml
   train_dataset:
-    class_path: src.data.CustomINH5Dataset
+    class_path: src.data.ImageNetFolderDataset
     init_args:
-      data_dir: ./imagenet256_data
+      data_dir: /mnt/data/imagenet
+      image_size: 256
+      random_flip: true
   eval_dataset:
     class_path: src.data.ClassLabelRandomNDataset
     init_args:

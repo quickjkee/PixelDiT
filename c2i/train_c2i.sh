@@ -1,12 +1,15 @@
 #!/bin/bash
 
 NUM_NODES=1
-NUM_GPUS=8
+NUM_GPUS=1
 MASTER_ADDR=localhost
-MASTER_PORT=29500
+MASTER_PORT=29501
 NODE_RANK=0
 CONFIG_FILE="configs/pix256_xl.yaml"
 CKPT_PATH=""
+OUTPUT_DIR=""
+RESUME=""
+AUTO_RESUME=""
 C2I_ROOT=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$C2I_ROOT/.." && pwd)
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
@@ -41,6 +44,14 @@ while [[ $# -gt 0 ]]; do
             CKPT_PATH="$2"
             shift 2
             ;;
+        --output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --resume)
+            RESUME="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -53,9 +64,28 @@ if [[ "$CONFIG_FILE" != /* ]]; then
     CONFIG_FILE="$C2I_ROOT/$CONFIG_FILE"
 fi
 
+# --resume: a path ending in .ckpt resumes that exact checkpoint; any other
+# (directory) path enables auto-resume from the latest checkpoint found there,
+# and doubles as the output dir if --output-dir was not given.
+if [[ -n "$RESUME" ]]; then
+    if [[ "$RESUME" == *.ckpt ]]; then
+        CKPT_PATH="$RESUME"
+    else
+        AUTO_RESUME=true
+        [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$RESUME"
+    fi
+fi
+
+# --output-dir: pin the exact checkpoint/log directory (no tag suffix).
+if [[ -n "$OUTPUT_DIR" ]]; then
+    export PIXELDIT_OUTPUT_DIR="$OUTPUT_DIR"
+fi
+
 echo "Config: $CONFIG_FILE"
 echo "Nodes: $NUM_NODES, GPUs per node: $NUM_GPUS"
 echo "Master: $MASTER_ADDR:$MASTER_PORT, Node rank: $NODE_RANK"
+echo "Output dir: ${OUTPUT_DIR:-<config default>}"
+echo "Resume: ${RESUME:-<none>} (auto_resume=${AUTO_RESUME:-config default})"
 
 CMD=(torchrun
     --nnodes="$NUM_NODES"
@@ -72,4 +102,8 @@ if [[ -n "$CKPT_PATH" ]]; then
     CMD+=("--ckpt_path=$CKPT_PATH")
 fi
 
-"${CMD[@]}"
+if [[ -n "$AUTO_RESUME" ]]; then
+    CMD+=("--auto_resume=true")
+fi
+
+CUDA_VISIBLE_DEVICES=3 "${CMD[@]}"

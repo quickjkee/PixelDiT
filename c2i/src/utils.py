@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 import lightning.pytorch as pl
-import lightning.pytorch.loggers.wandb as wandb
 import numpy as np
 import psutil
 import torch
@@ -24,7 +23,6 @@ from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 from lightning_utilities.core.rank_zero import rank_zero_info
 
-setattr(wandb, "_WANDB_AVAILABLE", True)
 torch.set_float32_matmul_precision("medium")
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -104,14 +102,59 @@ class CheckpointHook(ModelCheckpoint):
 
 
 class SaveImagesHook(Callback):
-    def __init__(self, save_dir: str = "val", save_compressed: bool = False):
+    def __init__(self, save_dir: str = "val", save_compressed: bool = False,
+                 compute_fid: bool = False,
+                 fid_stats_path: Optional[str] = None,
+                 inception_path: Optional[str] = None,
+                 fid_batch_size: int = 50,
+                 fid_metric_name: str = "val/fid"):
         super().__init__()
         self.save_dir = save_dir
         self.save_compressed = save_compressed
+        # --- online FID (JiT-style) ---
+        self.compute_fid = compute_fid
+        self.fid_stats_path = fid_stats_path
+        self.inception_path = inception_path
+        self.fid_batch_size = fid_batch_size
+        self.fid_metric_name = fid_metric_name
         self.samples = []
         self.target_dir = None
         self.executor_pool = None
         self._saved_num = 0
+
+    def _resolve_path(self, path: Optional[str]) -> Optional[str]:
+        """Resolve a (possibly relative) asset path against the c2i package root."""
+        if path is None or os.path.isabs(path):
+            return path
+        c2i_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(c2i_root, path)
+
+    def _compute_and_log_fid(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Compute FID from the gathered samples (rank 0 only) and log it."""
+        if not trainer.is_global_zero or len(self.samples) == 0:
+            return
+        if self.fid_stats_path is None:
+            rank_zero_info("[online-eval] compute_fid=True but fid_stats_path is unset; skipping FID")
+            return
+        from src.fid import calculate_fid_from_images
+
+        images = np.concatenate(self.samples)  # [N, H, W, 3] uint8
+        stats_path = self._resolve_path(self.fid_stats_path)
+        inception_path = self._resolve_path(self.inception_path)
+        fid = calculate_fid_from_images(
+            images,
+            stats_path,
+            device=pl_module.device,
+            batch_size=self.fid_batch_size,
+            inception_path=inception_path,
+        )
+        rank_zero_info(f"[online-eval] step={trainer.global_step} epoch={trainer.current_epoch} "
+                       f"n={len(images)} FID={fid:.4f}")
+        if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
+            try:
+                trainer.logger.experiment.add_scalar(self.fid_metric_name, fid, trainer.global_step)
+            except Exception:
+                pass
 
     def save_start(self, target_dir: str):
         self.samples = []
@@ -182,6 +225,8 @@ class SaveImagesHook(Callback):
         return self.process_batch(trainer, pl_module, outputs, batch)
 
     def on_validation_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        if self.compute_fid:
+            self._compute_and_log_fid(trainer, pl_module)
         self.save_end()
 
     def on_predict_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
@@ -204,6 +249,57 @@ class SaveImagesHook(Callback):
 
     def state_dict(self) -> Dict[str, Any]:
         return dict()
+
+
+class EvalScheduleHook(Callback):
+    """JiT-style epoch-based control of online evaluation.
+
+    Mirrors JiT's `--online_eval` / `--eval_freq`: evaluation (the validation
+    loop = sample generation + FID via SaveImagesHook) runs only on selected
+    epochs. Gating is done by toggling `trainer.limit_val_batches`, which
+    `trainer.enable_validation` reads live, so non-eval epochs skip the whole
+    (expensive) generation pass.
+
+    Use together with `trainer.check_val_every_n_epoch: 1` so Lightning offers
+    a validation opportunity every epoch and this hook decides whether to take
+    it.
+
+    Args:
+        enable: master on/off switch for online evaluation.
+        eval_start_epoch: do not evaluate before this epoch (warmup).
+        eval_every_n_epochs: evaluate every N epochs once started.
+        eval_on_last_epoch: always evaluate on the final training epoch.
+    """
+
+    def __init__(self, enable: bool = True, eval_start_epoch: int = 0,
+                 eval_every_n_epochs: int = 1, eval_on_last_epoch: bool = True):
+        super().__init__()
+        self.enable = enable
+        self.eval_start_epoch = eval_start_epoch
+        self.eval_every_n_epochs = max(1, eval_every_n_epochs)
+        self.eval_on_last_epoch = eval_on_last_epoch
+
+    def _should_eval(self, trainer: Trainer) -> bool:
+        if not self.enable:
+            return False
+        epoch = trainer.current_epoch
+        if self.eval_on_last_epoch and trainer.max_epochs is not None \
+                and epoch + 1 == trainer.max_epochs:
+            return True
+        if epoch < self.eval_start_epoch:
+            return False
+        return (epoch - self.eval_start_epoch) % self.eval_every_n_epochs == 0
+
+    def _apply(self, trainer: Trainer) -> None:
+        run = self._should_eval(trainer)
+        # 1.0 -> run full validation this epoch; 0.0 -> disable it entirely.
+        trainer.limit_val_batches = 1.0 if run else 0.0
+
+    def on_train_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        self._apply(trainer)
+
+    def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        self._apply(trainer)
 
 
 @torch.no_grad()

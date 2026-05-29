@@ -14,6 +14,8 @@ import h5py
 import numpy as np
 import PIL.Image
 import torch
+import torchvision
+import yaml
 from lightning.pytorch import LightningDataModule
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch.utils.data import DataLoader, Dataset, IterableDataset
@@ -76,6 +78,63 @@ class CustomINH5Dataset(Dataset):
         return normalized_image, target, metadata
 
 
+def center_crop_arr(pil_image, image_size):
+    """
+    Center cropping implementation from ADM (same as used in JiT / REPA).
+    https://github.com/openai/guided-diffusion/blob/main/guided_diffusion/image_datasets.py#L126
+    """
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=PIL.Image.BOX)
+
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=PIL.Image.BICUBIC)
+
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return PIL.Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+
+class ImageNetFolderDataset(Dataset):
+    """
+    Raw-ImageNet loader (JiT-style) that is a drop-in replacement for
+    CustomINH5Dataset: it reads images directly from `<data_dir>/train`
+    with torchvision.datasets.ImageFolder, so no .h5 preprocessing is needed.
+
+    Returns the same tuple the REPA trainer expects:
+      normalized_image : float [3, H, W] in [-1, 1]
+      target           : int class label
+      metadata         : {"raw_image": float [3, H, W] in [0, 1], "class": int}
+    """
+
+    def __init__(self, data_dir: str, image_size: int = 256, random_flip: bool = True, split: str = "train"):
+        root = os.path.join(data_dir, split)
+        self.dataset = torchvision.datasets.ImageFolder(root)
+        self.image_size = image_size
+        self.random_flip = random_flip
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        pil_image, target = self.dataset[index]
+        pil_image = pil_image.convert("RGB")
+        pil_image = center_crop_arr(pil_image, self.image_size)
+        if self.random_flip and random.random() < 0.5:
+            pil_image = pil_image.transpose(PIL.Image.FLIP_LEFT_RIGHT)
+
+        arr = np.array(pil_image)  # [H, W, 3] uint8
+        image_tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float() / 255.0  # [3, H, W] in [0, 1]
+        normalized_image = (image_tensor - 0.5) / 0.5  # [-1, 1]
+
+        target = int(target)
+        metadata = {
+            "raw_image": image_tensor,
+            "class": target,
+        }
+        return normalized_image, target, metadata
+
+
 def _clean_filename(s: str) -> str:
     s = s.strip().strip('.')
     s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('ASCII')
@@ -96,7 +155,7 @@ def _save_fn(image, metadata, root_path):
 
 
 class RandomNDataset(Dataset):
-    def __init__(self, latent_shape=(4, 64, 64), conditions: Union[int, List, str] = None,
+    def __init__(self, latent_shape=(4, 64, 64), conditions: Union[int, List[Any], str] = None,
                  seeds=None, max_num_instances=50000, num_samples_per_instance=-1):
         if isinstance(conditions, int):
             conditions = list(range(conditions))
@@ -148,7 +207,7 @@ class RandomNDataset(Dataset):
 
 
 class ClassLabelRandomNDataset(RandomNDataset):
-    def __init__(self, latent_shape=(4, 64, 64), num_classes=1000, conditions: Union[int, List, str] = None,
+    def __init__(self, latent_shape=(4, 64, 64), num_classes=1000, conditions: Union[int, List[Any], str] = None,
                  seeds=None, max_num_instances=50000, num_samples_per_instance=-1):
         if conditions is None:
             conditions = list(range(num_classes))
@@ -197,6 +256,59 @@ def eval_collate_fn(batch):
     return x, y, metadata
 
 
+def create_dataloader(dataloader_config_path: str, batch_size: int, skip_rows: int = 0):
+    """
+    Build a yt_tools IterableDataloader from a YAML config (same mechanism as
+    JiT's util/crop.create_dataloader). Imports of yt_tools/omegaconf are lazy
+    so this module still loads on clusters where yt_tools is unavailable.
+    """
+    from omegaconf import OmegaConf
+    from yt_tools.utils import instantiate_from_config
+
+    with open(dataloader_config_path) as f:
+        dataloader_config = OmegaConf.create(yaml.load(f, Loader=yaml.SafeLoader))
+    dataloader_config["params"]["batch_size"] = batch_size
+    return instantiate_from_config(dataloader_config, skip_rows=skip_rows)
+
+
+class YTBatchAdapter:
+    """
+    Wraps a yt_tools IterableDataloader (which yields already-batched dicts like
+    {"image": [B,3,H,W] in [0,255], "label": [...]}) and converts each batch into
+    PixelDiT's training contract consumed in src/lightning.py:
+        x        : float [B,3,H,W] in [-1, 1]
+        y        : list[int] class labels
+        metadata : {"raw_image": float [B,3,H,W] in [0,1], "class": list[int]}
+    """
+
+    def __init__(self, yt_loader, image_key: str = "image", label_key: str = "label"):
+        self.yt_loader = yt_loader
+        self.image_key = image_key
+        self.label_key = label_key
+
+    def __iter__(self):
+        for batch in self.yt_loader:
+            img = batch[self.image_key]
+            if not torch.is_tensor(img):
+                img = torch.as_tensor(np.asarray(img))
+            img = img.float()
+            # [B,H,W,3] -> [B,3,H,W] if needed
+            if img.ndim == 4 and img.shape[1] != 3 and img.shape[-1] == 3:
+                img = img.permute(0, 3, 1, 2).contiguous()
+            # [0,255] -> [0,1]
+            if img.max() > 1.5:
+                img = img / 255.0
+
+            raw_image = img                       # DINOv2 encoder expects [0,1]
+            x = (img - 0.5) / 0.5                  # [-1, 1]
+            y = [int(v) for v in batch[self.label_key]]
+            metadata = {"raw_image": raw_image, "class": y}
+            yield x, y, metadata
+
+    def __len__(self):
+        return len(self.yt_loader)
+
+
 class DataModule(LightningDataModule):
     def __init__(self,
                  train_dataset: Dataset = None,
@@ -209,8 +321,10 @@ class DataModule(LightningDataModule):
                  eval_num_workers: int = 4,
                  pred_batch_size: int = 32,
                  pred_num_workers: int = 4,
+                 yt_config_path: str = None,
                  seed: int = None):
         super().__init__()
+        self.yt_config_path = yt_config_path
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.pred_dataset = pred_dataset
@@ -228,6 +342,13 @@ class DataModule(LightningDataModule):
         return batch
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
+        # YT-table path (JiT-style): the yt_tools loader yields fully-batched
+        # dicts, so we bypass torch Dataset/sampler/collate and adapt batches.
+        if self.yt_config_path is not None:
+            yt_loader = create_dataloader(self.yt_config_path, self.train_batch_size)
+            self._train_dataloader = YTBatchAdapter(yt_loader)
+            return self._train_dataloader
+
         micro_batch_size = getattr(self.train_dataset, "micro_batch_size", None)
         if micro_batch_size is not None:
             assert self.train_batch_size % micro_batch_size == 0

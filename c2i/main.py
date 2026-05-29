@@ -107,10 +107,17 @@ class ReWriteRootDirCli(LightningCLI):
         if default_root_dir is None:
             default_root_dir = os.path.join(os.getcwd(), "workdirs")
 
-        dirname = ""
-        for v, k in self._get(self.config, "tags", default={}).items():
-            dirname += f"{v}_{k}"
-        default_root_dir = os.path.join(default_root_dir, dirname)
+        # Allow the launcher/cluster to pin an exact output dir, used verbatim
+        # with no tag suffix (mirrors a --output_dir flag). Otherwise fall back
+        # to <default_root_dir>/<tags> as before.
+        output_dir_override = os.environ.get("PIXELDIT_OUTPUT_DIR")
+        if output_dir_override:
+            default_root_dir = output_dir_override
+        else:
+            dirname = ""
+            for v, k in self._get(self.config, "tags", default={}).items():
+                dirname += f"{v}_{k}"
+            default_root_dir = os.path.join(default_root_dir, dirname)
         
         is_resume = self._get(self.config_init, "ckpt_path", default=None)
         auto_resume = self._get(self.config_init, "auto_resume", default=False)

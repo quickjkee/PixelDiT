@@ -15,9 +15,9 @@ trainer:
   gradient_clip_val: 0.5
   gradient_clip_algorithm: norm
   logger:
-      class_path: lightning.pytorch.loggers.WandbLogger
+      class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
-        project: pix_dit_c2i
+        save_dir: ./train_logs/
         name: *exp
   num_sanity_val_steps: 0
   max_steps: 4000000
