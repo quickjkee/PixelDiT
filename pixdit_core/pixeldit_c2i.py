@@ -187,6 +187,8 @@ class PixDiT(nn.Module):
         patch_size=2,
         num_classes=1000,
         use_pixel_abs_pos=True,
+        in_context_len=0,
+        in_context_start=0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -199,6 +201,16 @@ class PixDiT(nn.Module):
         self.pixel_hidden_size = int(pixel_hidden_size)
         self.num_classes = int(num_classes)
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
+        # JiT-style in-context (register) tokens prepended to the patch stream
+        # at block `in_context_start`, then stripped before the pixel stream.
+        self.in_context_len = int(in_context_len)
+        self.in_context_start = int(in_context_start)
+        if self.in_context_len > 0:
+            if not (0 <= self.in_context_start < self.patch_depth):
+                raise ValueError(
+                    f"in_context_start must be in [0, patch_depth={self.patch_depth}), "
+                    f"got {self.in_context_start}")
+            self.in_context_posemb = nn.Parameter(torch.zeros(1, self.in_context_len, self.hidden_size))
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT expects pixel_depth > 0 to preserve the dual-level pipeline")
 
@@ -239,6 +251,8 @@ class PixDiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.s_embedder.proj.bias, 0)
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        if self.in_context_len > 0:
+            nn.init.normal_(self.in_context_posemb, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.zeros_(self.final_layer.linear.weight)
@@ -262,8 +276,21 @@ class PixDiT(nn.Module):
 
         if s is None:
             s = self.s_embedder(x_patches)
-            for block in self.patch_blocks:
-                s = block(s, c, pos, mask)
+            P = self.in_context_len
+            if P > 0:
+                # Identity rotary entries (1+0j) for the prefix tokens so RoPE
+                # leaves the register tokens unrotated; patch tokens keep 2D RoPE.
+                ones = torch.ones(P, pos.shape[-1], dtype=pos.dtype, device=x.device)
+                pos_ctx = torch.cat([ones, pos], dim=0)
+            for i, block in enumerate(self.patch_blocks):
+                if P > 0 and i == self.in_context_start:
+                    # JiT-style: class-embedding-derived register tokens + learnable pos-emb
+                    ctx = y_emb.expand(B, P, self.hidden_size) + self.in_context_posemb
+                    s = torch.cat([ctx, s], dim=1)
+                block_pos = pos_ctx if (P > 0 and i >= self.in_context_start) else pos
+                s = block(s, c, block_pos, mask)
+            if P > 0:
+                s = s[:, P:]  # strip register tokens before the pixel stream
             s = nn.functional.silu(t_emb + s)
 
         batch_size, length, _ = s.shape
