@@ -481,7 +481,13 @@ class REPATrainer(BaseTrainer):
         handle = net.patch_blocks[self.align_layer - 1].register_forward_hook(forward_hook)
 
         out = net(x_t, t, y)
-        src_feature = self.proj(src_feature[0])
+        feat = src_feature[0]
+        # Drop JiT-style in-context (register) tokens if present at the aligned
+        # layer: they are prepended, and REPA aligns on spatial patch tokens only.
+        n_ctx = getattr(net, "in_context_len", 0)
+        if n_ctx > 0 and getattr(net, "in_context_start", 0) <= self.align_layer - 1:
+            feat = feat[:, n_ctx:]
+        src_feature = self.proj(feat)
         handle.remove()
 
         with torch.no_grad():
