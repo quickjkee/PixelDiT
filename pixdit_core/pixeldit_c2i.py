@@ -251,26 +251,33 @@ class PixDiT(nn.Module):
             nn.init.zeros_(block.adaLN_modulation[0].bias)
 
     def forward(self, x, t, y, s=None, mask=None):
+
         B, _, H, W = x.shape
         pos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
+
         x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
         y_emb = self.y_embedder(y).view(B, 1, self.hidden_size)
         c = nn.functional.silu(t_emb + y_emb)
+
         if s is None:
             s = self.s_embedder(x_patches)
             for block in self.patch_blocks:
                 s = block(s, c, pos, mask)
             s = nn.functional.silu(t_emb + s)
+
         batch_size, length, _ = s.shape
         s_cond = s.view(batch_size * length, self.hidden_size)
         x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
         for blk in self.pixel_blocks:
             x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
+
         x_pixels = self.final_layer(x_pixels)
+
         C_out = self.out_channels
         P2 = self.patch_size * self.patch_size
         x_pixels = x_pixels.view(B, length, P2, C_out).permute(0, 3, 2, 1).contiguous()
         x_pixels = x_pixels.view(B, C_out * P2, length)
         x_img = torch.nn.functional.fold(x_pixels, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
+        
         return x_img
