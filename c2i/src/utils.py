@@ -22,6 +22,7 @@ from lightning.pytorch import Callback, LightningModule, Trainer
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 from lightning_utilities.core.rank_zero import rank_zero_info
+from yt_tools.nirvana_utils import copy_out_to_snapshot
 
 torch.set_float32_matmul_precision("medium")
 os.environ["NCCL_DEBUG"] = "WARN"
@@ -99,6 +100,18 @@ class CheckpointHook(ModelCheckpoint):
         checkpoint: Dict[str, Any],
     ) -> None:
         checkpoint.pop("callbacks", None)
+
+    def _save_checkpoint(self, trainer: Trainer, filepath: str) -> None:
+        super()._save_checkpoint(trainer, filepath)
+
+        if trainer.is_global_zero:
+            # filepath is the actual .ckpt path, e.g.
+            # $SNAPSHOT_PATH/epoch=0-step=10000.ckpt
+            print(f"[nirvana] saved checkpoint: {filepath}", flush=True)
+
+            # Copy the whole output dir to persistent snapshot storage.
+            # Use your platform-provided function here.
+            copy_out_to_snapshot(trainer.default_root_dir)
 
 
 class SaveImagesHook(Callback):
