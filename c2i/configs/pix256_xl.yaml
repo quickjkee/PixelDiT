@@ -72,7 +72,7 @@ model:
         # JiT-style in-context (register) tokens on the patch stream.
         # in_context_len: 0 disables it. in_context_start picks the block to inject at.
         in_context_len: 32
-        in_context_start: 8
+        in_context_start: 0
   diffusion_trainer:
     class_path: src.diffusion.REPATrainer
     init_args:
