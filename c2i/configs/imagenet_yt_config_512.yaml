@@ -1,0 +1,36 @@
+# Template YT-table dataloader config for PixelDiT c2i training.
+# Modeled on JiT/configs/imagenet_yt_config.yaml. Used by
+# src.data.create_dataloader() -> yt_tools.utils.instantiate_from_config.
+#
+# Enable it by setting `yt_config_path: configs/imagenet_yt_config.yaml`
+# in the `data:` block of configs/pix256_xl.yaml.
+#
+# The yt_tools loader yields batches as {"image": [B,3,H,W], "label": [...]};
+# src.data.YTBatchAdapter converts them to PixelDiT's (x, y, metadata) contract.
+# `batch_size` is injected automatically from data.train_batch_size.
+target: yt_tools.dataloader.IterableDataloader
+params:
+  name: imagenet
+  dataset:
+    target: yt_tools.yt_iterable_dataset.IterableYTDataset
+    params:
+      table: //home/yr/ILSVRC/train   # <-- set to your YT table path
+      yt_proxy: hahn                   # <-- set to your YT proxy
+      buf_size: 1024
+      preproc_workers: 4
+  preprocess:
+    - in_map:
+        image_bytes: image
+      target: yt_tools.processing.process_fns.imagenet_preprocessing
+      params:
+        img_size: 512
+        model_type: jit               # crop/resize to 256x256 RGB; adapter handles [0,255]->[0,1]
+      out_map: image
+    - in_map:
+        data: label
+      target: yt_tools.processing.process_fns.identity
+      out_map: label
+  stackable:
+    - image
+  non_stackable:
+    - label
