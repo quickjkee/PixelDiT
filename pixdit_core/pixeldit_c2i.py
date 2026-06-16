@@ -285,7 +285,7 @@ class PixDiT(nn.Module):
             for i, block in enumerate(self.patch_blocks):
                 if P > 0 and i == self.in_context_start:
                     # JiT-style: class-embedding-derived register tokens + learnable pos-emb
-                    ctx = self.in_context_posemb.expand(B, -1, -1) #y_emb.expand(B, P, self.hidden_size) + self.in_context_posemb
+                    ctx =  y_emb.expand(B, P, self.hidden_size) + self.in_context_posemb # self.in_context_posemb.expand(B, -1, -1)
                     s = torch.cat([ctx, s], dim=1)
                 block_pos = pos_ctx if (P > 0 and i >= self.in_context_start) else pos
                 s = block(s, c, block_pos, mask)
